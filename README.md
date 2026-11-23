@@ -16,6 +16,7 @@
 │   └── vite.config.ts        dev server 配置（open: false）
 ├── backend/                  FastAPI（Python） 后端
 │   ├── app/routers/resource.py  通用查询/导出/登记/动作接口
+│   ├── app/routers/stream_export.py  流式数据导出的执行/版本清单/文件下载接口
 │   ├── app/services/<key>.py    每个模块独立领域逻辑
 │   ├── app/services/base.py     共享服务骨架
 │   └── app/store.py          内存数据仓库与示例数据
@@ -78,6 +79,19 @@ npm run dev
   `frontend/src/domain/<模块>.ts`，用于承载真实业务差异并维持36题位容量。
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
+
+## 流式数据导出的调用日志数据源
+
+- 导出任务的数据源分「采集载荷」和「调用日志」两种：调用日志按 API 名称精确匹配 +
+  调用时间窗口筛选（同名载荷、`billing-test` 这类相近名称都不会混入文件），文件保留
+  请求时间、结果、耗时，并在末尾给出逐类合计。
+- 专用接口（见 `app/routers/stream_export.py`）：
+  - `POST /api/stream_export/log-task` 从 API 调用日志页登记导出任务（API 与时段随任务留档）；
+  - `POST /api/stream_export/{id}/execute` 执行导出，`interrupt_after` 可演练长导出中断；
+  - `GET /api/stream_export/{id}/manifest` 查看每版调用的范围、行数与逐类合计；
+  - `GET /api/stream_export/{id}/download?version=N` 按版下载文件，缺省取最新版。
+- 每次成功导出提交一个不可变版本，明细行与合计来自同一次扫描快照；中断的半成品
+  不提交版本，重试后按新文件或原文件的下载地址取回，不会拿到混杂两轮的合计。
 
 领域：数据工程
 子方向：数据采集、爬虫与RPA

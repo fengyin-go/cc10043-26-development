@@ -1,6 +1,9 @@
 """API调用日志领域服务：记录每次API调用的请求参数、响应和耗时，管理日志查询和统计分析。
 
 数据链路位置：监控采集层，记录全链路中每个API调用的详细日志，支撑调用统计和失败分析。
+
+查询口径与流式数据导出保持一致：API名称 精确匹配（billing 不会带出 billing-test），
+调用时间 支持 '起~止' 区间筛选，保证页面筛选结果和下载文件对得上。
 """
 from __future__ import annotations
 
@@ -8,7 +11,19 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services.stream_export import _in_window
 from app.store import store
+
+
+def _status_for_code(status_code: int) -> tuple[str, bool]:
+    """按响应状态码归类调用结果。"""
+    if 200 <= status_code < 300:
+        return "成功", False
+    if 400 <= status_code < 500:
+        return "客户端错误", True
+    if status_code >= 500:
+        return "服务端错误", True
+    return "超时", True
 
 
 class ApiLoggerService(BaseModuleService):
@@ -21,6 +36,52 @@ class ApiLoggerService(BaseModuleService):
     ACTION_RULES = {"查看详情": "客户端错误", "重试调用": "服务端错误"}
     NEGATIVE_ACTIONS = []
 
+    def list_entries(
+        self,
+        *,
+        filters: dict[str, str] | None = None,
+        keyword: str | None = None,
+        status: str | None = None,
+        page: int = 1,
+        size: int = 20,
+    ) -> tuple[list[dict[str, Any]], int]:
+        rows = list(store.rows(self.MODULE))
+        for field, expected in (filters or {}).items():
+            if field not in self.LIST_FIELDS:
+                continue
+            if field == "API名称":
+                # 精确匹配：billing 不命中 billing-test，与导出文件口径一致。
+                rows = [r for r in rows if str(r.get("API名称") or "").strip() == expected.strip()]
+            elif field == "调用时间" and "~" in expected:
+                start, end = (part.strip() for part in expected.split("~", 1))
+                rows = [r for r in rows if _in_window(str(r.get("调用时间") or ""), start, end)]
+            else:
+                rows = [
+                    r for r in rows
+                    if expected.casefold() in str(r.get(field, "")).casefold()
+                ]
+        if keyword and self.LIST_FIELDS:
+            field = self.LIST_FIELDS[0]
+            rows = [row for row in rows if keyword.casefold() in str(row.get(field, "")).casefold()]
+        if status:
+            rows = [row for row in rows if row.get("status") == status]
+        total = len(rows)
+        start = (page - 1) * size
+        return rows[start:start + size], total
+
+    def create_entry(self, values: dict[str, Any]) -> tuple[dict[str, Any] | None, list[str]]:
+        """登记调用日志：按响应状态码推导调用结果，保证逐类合计有据可依。"""
+        entry, missing = super().create_entry(values)
+        if entry is None:
+            return None, missing
+        code_text = str(entry.get("响应状态码") or "").strip()
+        if code_text.isdigit():
+            status, abnormal = _status_for_code(int(code_text))
+            entry["status"] = status
+            entry["abnormal"] = abnormal
+            entry["pending"] = not abnormal
+        return entry, []
+
     # ---- 业务扩展：日志收集与统计分析 ----
 
     def log_api_call(self, api_name: str, params: str, status_code: int, elapsed_ms: int) -> dict[str, Any]:
@@ -28,18 +89,7 @@ class ApiLoggerService(BaseModuleService):
         rows = store.rows(self.MODULE)
         log_id = max((int(r.get("id", 0)) for r in rows), default=0) + 1
         now = datetime.now(timezone.utc).isoformat()
-        if 200 <= status_code < 300:
-            status = "成功"
-            abnormal = False
-        elif 400 <= status_code < 500:
-            status = "客户端错误"
-            abnormal = True
-        elif status_code >= 500:
-            status = "服务端错误"
-            abnormal = True
-        else:
-            status = "超时"
-            abnormal = True
+        status, abnormal = _status_for_code(status_code)
         entry = {
             "id": log_id, "调用时间": now, "API名称": api_name,
             "请求参数摘要": params, "响应状态码": str(status_code),
@@ -89,14 +139,19 @@ class ApiLoggerService(BaseModuleService):
         return {"ok": True, "message": "已路由至隔离区", "isolation_id": fid}
 
     def export_logs(self, api_name: str, time_range: tuple[str, str], export_format: str = "csv") -> dict[str, Any]:
-        """导出API调用日志到流式数据导出。"""
+        """导出API调用日志到流式数据导出：登记一个调用日志类型的导出任务。"""
         export_rows = store.rows("stream_export")
         eid = max((int(r.get("id", 0)) for r in export_rows), default=0) + 1
         export_rows.append({
             "id": eid, "任务名称": f"日志导出-{api_name}",
-            "数据源": api_name, "导出格式": export_format,
+            "数据源": "调用日志", "数据源类型": "调用日志",
+            "API名称": api_name,
+            "时段开始": time_range[0], "时段结束": time_range[1],
+            "导出格式": export_format,
             "时间范围": f"{time_range[0]}~{time_range[1]}",
-            "文件大小": "0", "status": "排队中", "pending": True, "abnormal": False,
+            "文件大小": "0", "来源模块": "api_logger",
+            "status": "排队中", "pending": True, "abnormal": False,
+            "versions": [],
         })
         return {"ok": True, "export_id": eid, "api_name": api_name}
 

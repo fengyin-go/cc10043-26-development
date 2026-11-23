@@ -20,7 +20,8 @@ export default defineConfig({
     open: false,
     strictPort: false,
     proxy: {
-      '/api': {
+      // 只代理真正的后端接口（/api/ 前缀），避免 api_logger 等模块页路由被误转发
+      '/api/': {
         target: proxyTarget,
         changeOrigin: true,
       },
